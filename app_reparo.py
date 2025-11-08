@@ -1,0 +1,531 @@
+import streamlit as st
+import sqlite3
+import pandas as pd
+from datetime import datetime
+from uuid import uuid4
+import re
+
+# --- 1. CONFIGURAÇÕES E CONSTANTES ---
+DB_NAME = 'reparos.db'
+
+# --- 2. FUNÇÕES DO BANCO DE DADOS (SQLite) ---
+def init_db():
+    """Cria a tabela de reparos se ela não existir."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS registros (
+            id TEXT PRIMARY KEY,
+            vin TEXT NOT NULL,
+            operador_id TEXT,
+            hora_inicio TEXT,
+            hora_fim TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def validar_vin(vin):
+    """Valida o formato do VIN (17 caracteres alfanuméricos)."""
+    if not vin:
+        return False, "VIN não pode estar vazio."
+    vin_limpo = vin.upper().strip()
+    if len(vin_limpo) != 17:
+        return False, "VIN deve ter exatamente 17 caracteres."
+    if not re.match(r'^[A-HJ-NPR-Z0-9]{17}$', vin_limpo):
+        return False, "VIN contém caracteres inválidos. Use apenas letras e números (exceto I, O, Q)."
+    return True, vin_limpo
+
+def verificar_reparo_aberto(vin):
+    """Verifica se existe reparo em aberto para o VIN."""
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, operador_id, hora_inicio FROM registros 
+        WHERE vin = ? AND hora_fim IS NULL 
+        ORDER BY hora_inicio DESC 
+        LIMIT 1
+    """, (vin.upper(),))
+    resultado = c.fetchone()
+    conn.close()
+    return resultado
+
+def iniciar_reparo(vin, operador_id):
+    """Registra o início do reparo no banco de dados."""
+    # Valida VIN
+    vin_valido, vin_formatado = validar_vin(vin)
+    if not vin_valido:
+        return False, vin_formatado
+    
+    # Verifica se já existe reparo em aberto
+    reparo_aberto = verificar_reparo_aberto(vin_formatado)
+    if reparo_aberto:
+        hora_inicio_existente = datetime.strptime(reparo_aberto[2], '%Y-%m-%d %H:%M:%S')
+        tempo_decorrido = datetime.now() - hora_inicio_existente
+        return False, f"Já existe um reparo em aberto para este VIN iniciado há {int(tempo_decorrido.total_seconds() / 60)} minutos. Finalize o reparo anterior primeiro."
+    
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    reparo_id = str(uuid4())
+    hora_inicio = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        c.execute("INSERT INTO registros (id, vin, operador_id, hora_inicio) VALUES (?, ?, ?, ?)",
+                  (reparo_id, vin_formatado, operador_id.strip().upper(), hora_inicio))
+        conn.commit()
+        return True, reparo_id
+    except sqlite3.Error as e:
+        return False, f"Erro ao iniciar: {e}"
+    finally:
+        conn.close()
+
+def finalizar_reparo(vin):
+    """Registra a hora de fim para o último reparo INCOMPLETO desse VIN."""
+    # Valida VIN
+    vin_valido, vin_formatado = validar_vin(vin)
+    if not vin_valido:
+        return False, vin_formatado, None, None
+    
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    hora_fim = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Encontra o reparo mais recente para este VIN que ainda não foi finalizado
+    c.execute("""
+        SELECT id, hora_inicio, operador_id FROM registros 
+        WHERE vin = ? AND hora_fim IS NULL 
+        ORDER BY hora_inicio DESC 
+        LIMIT 1
+    """, (vin_formatado,))
+    
+    reparo_incompleto = c.fetchone()
+    
+    if reparo_incompleto:
+        reparo_id = reparo_incompleto[0]
+        hora_inicio = datetime.strptime(reparo_incompleto[1], '%Y-%m-%d %H:%M:%S')
+        operador_id = reparo_incompleto[2]
+        hora_fim_dt = datetime.strptime(hora_fim, '%Y-%m-%d %H:%M:%S')
+        duracao = hora_fim_dt - hora_inicio
+        
+        c.execute("UPDATE registros SET hora_fim = ? WHERE id = ?", (hora_fim, reparo_id))
+        conn.commit()
+        conn.close()
+        return True, reparo_id, duracao, operador_id
+    else:
+        conn.close()
+        return False, "Nenhum reparo em aberto encontrado para este VIN.", None, None
+
+def get_registros(filtro_operador=None, filtro_vin=None, filtro_data_inicio=None, filtro_data_fim=None, apenas_completos=False):
+    """Retorna todos os registros para visualização e cálculo."""
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    
+    query = "SELECT id, vin, operador_id, hora_inicio, hora_fim FROM registros WHERE 1=1"
+    params = []
+    
+    if filtro_operador:
+        query += " AND operador_id = ?"
+        params.append(filtro_operador.upper())
+    if filtro_vin:
+        query += " AND vin = ?"
+        params.append(filtro_vin.upper())
+    if filtro_data_inicio:
+        query += " AND DATE(hora_inicio) >= ?"
+        params.append(filtro_data_inicio)
+    if filtro_data_fim:
+        query += " AND DATE(hora_inicio) <= ?"
+        params.append(filtro_data_fim)
+    if apenas_completos:
+        query += " AND hora_fim IS NOT NULL"
+    
+    query += " ORDER BY hora_inicio DESC"
+    
+    df = pd.read_sql_query(query, conn, params=params if params else None)
+    conn.close()
+    
+    if df.empty:
+        return df
+    
+    # Processamento para cálculo do tempo
+    df['hora_inicio'] = pd.to_datetime(df['hora_inicio'])
+    df['hora_fim'] = pd.to_datetime(df['hora_fim'], errors='coerce')
+    df['duracao'] = df['hora_fim'] - df['hora_inicio']
+    df['duracao_minutos'] = df['duracao'].dt.total_seconds() / 60
+    df['duracao_horas'] = df['duracao_minutos'] / 60
+    
+    # Formatação de data
+    df['data'] = df['hora_inicio'].dt.date
+    
+    # Seleciona e renomeia as colunas para o display
+    colunas_display = {
+        'vin': 'VIN',
+        'operador_id': 'Operador',
+        'hora_inicio': 'Início',
+        'hora_fim': 'Fim',
+        'duracao_minutos': 'Duração (min)',
+        'duracao_horas': 'Duração (h)',
+        'data': 'Data'
+    }
+    
+    df_display = df.rename(columns=colunas_display)
+    
+    return df_display
+
+def get_reparos_abertos():
+    """Retorna todos os reparos que ainda não foram finalizados."""
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query("""
+        SELECT vin, operador_id, hora_inicio 
+        FROM registros 
+        WHERE hora_fim IS NULL 
+        ORDER BY hora_inicio DESC
+    """, conn)
+    conn.close()
+    
+    if df.empty:
+        return df
+    
+    df['hora_inicio'] = pd.to_datetime(df['hora_inicio'])
+    df['tempo_decorrido'] = datetime.now() - df['hora_inicio']
+    df['tempo_decorrido_min'] = df['tempo_decorrido'].dt.total_seconds() / 60
+    
+    return df.rename(columns={
+        'vin': 'VIN',
+        'operador_id': 'Operador',
+        'hora_inicio': 'Início',
+        'tempo_decorrido_min': 'Tempo Decorrido (min)'
+    })
+
+
+# --- 3. INTERFACE DO STREAMLIT ---
+def app():
+    st.set_page_config(
+        page_title="Registro de Tempo de Reparo", 
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Sidebar com informações
+    with st.sidebar:
+        st.header("📋 Sobre")
+        st.info("""
+        **Sistema de Registro de Tempo de Reparos**
+        
+        - Inicie o reparo apontando o VIN
+        - Finalize apontando o mesmo VIN
+        - Visualize estatísticas e relatórios
+        """)
+    
+    st.title("⏱️ Registro de Reparos e Inspeções")
+    st.subheader("Aponte o VIN para iniciar ou finalizar o serviço.")
+
+    # Tabs organizadas
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "▶️ Iniciar Reparo", 
+        "🛑 Finalizar Reparo", 
+        "📊 Visualizar Dados",
+        "⏳ Reparos em Aberto",
+        "📈 Relatórios"
+    ])
+    
+    # --- ABA 1: INICIAR REPARO ---
+    with tab1:
+        # Limpa os campos se a flag estiver ativa
+        if st.session_state.get('limpar_iniciar', False):
+            if 'op_id_start' in st.session_state:
+                del st.session_state['op_id_start']
+            if 'vin_start' in st.session_state:
+                del st.session_state['vin_start']
+            st.session_state['limpar_iniciar'] = False
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.header("Início do Serviço")
+            operador_id = st.text_input(
+                "ID do Operador (Obrigatório)", 
+                key="op_id_start", 
+                max_chars=20,
+                help="Digite o ID do operador que realizará o reparo."
+            )
+            vin_start = st.text_input(
+                "VIN do Carro", 
+                key="vin_start", 
+                max_chars=17, 
+                help="Digite ou escaneie o VIN (17 caracteres).", 
+                placeholder="Ex: 3FA2P00000X123456"
+            )
+            
+            if vin_start:
+                vin_start = vin_start.upper().strip()
+                # Validação visual
+                vin_valido, msg_validacao = validar_vin(vin_start)
+                if not vin_valido:
+                    st.error(f"⚠️ {msg_validacao}")
+                else:
+                    # Verifica se já existe reparo em aberto
+                    reparo_aberto = verificar_reparo_aberto(vin_start)
+                    if reparo_aberto:
+                        hora_inicio_existente = datetime.strptime(reparo_aberto[2], '%Y-%m-%d %H:%M:%S')
+                        tempo_decorrido = datetime.now() - hora_inicio_existente
+                        st.warning(f"⚠️ Já existe um reparo em aberto para este VIN iniciado há {int(tempo_decorrido.total_seconds() / 60)} minutos.")
+        
+        with col2:
+            st.markdown("### ℹ️ Informações")
+            st.info("""
+            **Como usar:**
+            1. Digite o ID do operador
+            2. Digite ou escaneie o VIN
+            3. Clique em "INICIAR REPARO"
+            
+            O sistema validará automaticamente o VIN.
+            """)
+        
+        if st.button("🔴 INICIAR REPARO AGORA", use_container_width=True, type="primary", key="btn_iniciar"):
+            if vin_start and operador_id:
+                sucesso, msg = iniciar_reparo(vin_start, operador_id)
+                if sucesso:
+                    st.success(f"✅ **Reparo iniciado com sucesso!**\n\n- VIN: **{vin_start}**\n- Operador: **{operador_id.upper()}**\n- Horário: **{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}**")
+                    st.balloons()
+                    # Define flag para limpar os campos na próxima renderização
+                    st.session_state['limpar_iniciar'] = True
+                    st.rerun()
+                else:
+                    st.error(f"❌ **Falha ao iniciar o reparo:**\n\n{msg}")
+            else:
+                st.warning("⚠️ Preencha o VIN e o ID do Operador para iniciar.")
+
+    # --- ABA 2: FINALIZAR REPARO ---
+    with tab2:
+        # Limpa o campo se a flag estiver ativa
+        if st.session_state.get('limpar_finalizar', False):
+            if 'vin_end' in st.session_state:
+                del st.session_state['vin_end']
+            st.session_state['limpar_finalizar'] = False
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.header("Fim do Serviço")
+            vin_end = st.text_input(
+                "VIN do Carro", 
+                key="vin_end", 
+                max_chars=17, 
+                help="Digite ou escaneie o mesmo VIN usado para iniciar o reparo.", 
+                placeholder="Ex: 3FA2P00000X123456"
+            )
+            
+            if vin_end:
+                vin_end = vin_end.upper().strip()
+                # Mostra informações do reparo em aberto
+                reparo_aberto = verificar_reparo_aberto(vin_end)
+                if reparo_aberto:
+                    hora_inicio_existente = datetime.strptime(reparo_aberto[2], '%Y-%m-%d %H:%M:%S')
+                    tempo_decorrido = datetime.now() - hora_inicio_existente
+                    minutos = int(tempo_decorrido.total_seconds() / 60)
+                    horas = minutos // 60
+                    min_restantes = minutos % 60
+                    st.info(f"📋 **Reparo encontrado:**\n- Operador: **{reparo_aberto[1]}**\n- Iniciado: **{hora_inicio_existente.strftime('%d/%m/%Y %H:%M:%S')}**\n- Tempo decorrido: **{horas}h {min_restantes}min**")
+                else:
+                    st.warning("⚠️ Nenhum reparo em aberto encontrado para este VIN.")
+        
+        with col2:
+            st.markdown("### ℹ️ Informações")
+            st.info("""
+            **Ao finalizar:**
+            - O tempo total será calculado
+            - Os dados estarão disponíveis nos relatórios
+            """)
+        
+        if st.button("🟢 FINALIZAR REPARO AGORA", use_container_width=True, type="secondary", key="btn_finalizar"):
+            if vin_end:
+                sucesso, msg, duracao, operador = finalizar_reparo(vin_end)
+                if sucesso:
+                    minutos = int(duracao.total_seconds() / 60)
+                    horas = minutos / 60
+                    
+                    st.balloons()
+                    st.success(f"🎉 **Reparo finalizado com sucesso!**")
+                    
+                    # Mostra informações detalhadas
+                    col_info1, col_info2 = st.columns(2)
+                    with col_info1:
+                        st.metric("⏱️ Tempo Total", f"{minutos} min", f"{horas:.2f} horas")
+                    with col_info2:
+                        st.metric("👤 Operador", operador)
+                    
+                    st.info(f"📋 **Detalhes:**\n- VIN: **{vin_end}**\n- Finalizado em: **{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}**")
+                    
+                    # Define flag para limpar o campo na próxima renderização
+                    st.session_state['limpar_finalizar'] = True
+                    st.rerun()
+                else:
+                    st.warning(f"⚠️ **Atenção:** {msg}")
+            else:
+                st.warning("⚠️ Preencha o VIN para finalizar.")
+
+    # --- ABA 3: VISUALIZAR DADOS ---
+    with tab3:
+        st.header("Dados de Reparo Registrados")
+        
+        # Filtros
+        col_filtro1, col_filtro2, col_filtro3, col_filtro4 = st.columns(4)
+        with col_filtro1:
+            filtro_operador = st.text_input("Filtrar por Operador", key="filtro_op", placeholder="ID do operador")
+        with col_filtro2:
+            filtro_vin = st.text_input("Filtrar por VIN", key="filtro_vin", placeholder="VIN")
+        with col_filtro3:
+            filtro_data_inicio = st.date_input("Data Início", key="filtro_dt_inicio", value=None)
+        with col_filtro4:
+            filtro_data_fim = st.date_input("Data Fim", key="filtro_dt_fim", value=None)
+        
+        apenas_completos = st.checkbox("Mostrar apenas reparos finalizados", value=True, key="check_completos")
+        
+        df_registros = get_registros(
+            filtro_operador=filtro_operador if filtro_operador else None,
+            filtro_vin=filtro_vin.upper() if filtro_vin else None,
+            filtro_data_inicio=filtro_data_inicio.strftime('%Y-%m-%d') if filtro_data_inicio else None,
+            filtro_data_fim=filtro_data_fim.strftime('%Y-%m-%d') if filtro_data_fim else None,
+            apenas_completos=apenas_completos
+        )
+        
+        if not df_registros.empty:
+            # Seleciona colunas para exibição
+            colunas_exibir = ['VIN', 'Operador', 'Data', 'Início', 'Fim', 'Duração (min)']
+            df_exibir = df_registros[colunas_exibir]
+            st.dataframe(df_exibir, use_container_width=True, hide_index=True)
+            
+            st.markdown("---")
+            
+            # Métricas
+            reparos_completos = df_registros['Duração (min)'].dropna()
+            
+            if not reparos_completos.empty:
+                col_met1, col_met2, col_met3 = st.columns(3)
+                
+                with col_met1:
+                    tempo_medio = reparos_completos.mean()
+                    st.metric("⏱️ Tempo Médio (MTTR)", f"{tempo_medio:.1f} min")
+                
+                with col_met2:
+                    tempo_total = reparos_completos.sum()
+                    st.metric("⏱️ Tempo Total", f"{tempo_total:.1f} min", f"{tempo_total/60:.1f} h")
+                
+                with col_met3:
+                    total_reparos = len(reparos_completos)
+                    st.metric("📊 Total de Reparos", total_reparos)
+                
+                # Exportar CSV
+                st.markdown("---")
+                csv = df_exibir.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label="📥 Download dos Dados (CSV)",
+                    data=csv,
+                    file_name=f'registros_reparos_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
+                    mime='text/csv',
+                    use_container_width=True
+                )
+            else:
+                st.info("Nenhum reparo finalizado encontrado com os filtros aplicados.")
+        else:
+            st.info("Nenhum registro encontrado com os filtros aplicados.")
+    
+    # --- ABA 4: REPAROS EM ABERTO ---
+    with tab4:
+        st.header("Reparos em Andamento")
+        st.info("Lista de todos os reparos que foram iniciados mas ainda não foram finalizados.")
+        
+        df_abertos = get_reparos_abertos()
+        
+        if not df_abertos.empty:
+            # Seleciona apenas colunas relevantes
+            colunas_abertos = ['VIN', 'Operador', 'Início', 'Tempo Decorrido (min)']
+            df_abertos_display = df_abertos[colunas_abertos].copy()
+            df_abertos_display['Tempo Decorrido (min)'] = df_abertos_display['Tempo Decorrido (min)'].round(1)
+            
+            st.dataframe(df_abertos_display, use_container_width=True, hide_index=True)
+            
+            # Estatísticas
+            col_stat1, col_stat2 = st.columns(2)
+            with col_stat1:
+                st.metric("📊 Total de Reparos em Aberto", len(df_abertos))
+            with col_stat2:
+                tempo_total_aberto = df_abertos['Tempo Decorrido (min)'].sum()
+                st.metric("⏱️ Tempo Total em Aberto", f"{tempo_total_aberto:.1f} min", f"{tempo_total_aberto/60:.1f} h")
+        else:
+            st.success("✅ Nenhum reparo em aberto no momento!")
+    
+    # --- ABA 5: RELATÓRIOS ---
+    with tab5:
+        st.header("Relatórios e Análises")
+        
+        df_registros = get_registros(apenas_completos=True)
+        
+        if df_registros.empty:
+            st.info("Nenhum reparo finalizado ainda para gerar relatórios.")
+        else:
+            # Gráficos
+            col_graf1, col_graf2 = st.columns(2)
+            
+            with col_graf1:
+                st.subheader("📊 Reparos por Operador")
+                reparos_por_operador = df_registros.groupby('Operador').size().sort_values(ascending=False)
+                if not reparos_por_operador.empty:
+                    st.bar_chart(reparos_por_operador)
+            
+            with col_graf2:
+                st.subheader("⏱️ Tempo Médio por Operador")
+                tempo_medio_operador = df_registros.groupby('Operador')['Duração (min)'].mean().sort_values(ascending=False)
+                if not tempo_medio_operador.empty:
+                    st.bar_chart(tempo_medio_operador)
+            
+            st.markdown("---")
+            
+            # Gráfico de linha - Reparos ao longo do tempo
+            st.subheader("📈 Reparos ao Longo do Tempo")
+            reparos_por_data = df_registros.groupby('Data').size()
+            if not reparos_por_data.empty:
+                st.line_chart(reparos_por_data)
+            
+            st.markdown("---")
+            
+            # Tabela de resumo por operador
+            st.subheader("📋 Resumo por Operador")
+            resumo_operador = df_registros.groupby('Operador').agg({
+                'Duração (min)': ['count', 'mean', 'sum'],
+                'VIN': 'count'
+            }).round(2)
+            
+            resumo_operador.columns = ['Total Reparos', 'Tempo Médio (min)', 'Tempo Total (min)', 'Total VINs']
+            resumo_operador['Tempo Total (h)'] = (resumo_operador['Tempo Total (min)'] / 60).round(2)
+            
+            st.dataframe(resumo_operador, use_container_width=True)
+            
+            # Histórico por VIN
+            st.markdown("---")
+            st.subheader("🔍 Histórico por VIN")
+            vin_busca = st.text_input("Digite o VIN para ver o histórico", key="hist_vin", placeholder="VIN")
+            
+            if vin_busca:
+                vin_busca = vin_busca.upper().strip()
+                df_vin = get_registros(filtro_vin=vin_busca, apenas_completos=False)
+                if not df_vin.empty:
+                    st.dataframe(df_vin[['Operador', 'Data', 'Início', 'Fim', 'Duração (min)']], use_container_width=True, hide_index=True)
+                    
+                    # Estatísticas do VIN
+                    col_vin1, col_vin2 = st.columns(2)
+                    with col_vin1:
+                        st.metric("Total de Reparos", len(df_vin))
+                    with col_vin2:
+                        tempo_total_vin = df_vin['Duração (min)'].dropna().sum()
+                        st.metric("Tempo Total", f"{tempo_total_vin:.1f} min")
+                else:
+                    st.warning(f"Nenhum registro encontrado para o VIN {vin_busca}.")
+             
+if __name__ == "__main__":
+    init_db()  # Garante que o banco de dados seja inicializado ao rodar o script
+    app()
